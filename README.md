@@ -185,12 +185,16 @@ Node 18.18 or newer; anything in that range should be fine, but v25.9.0 is the o
 this has actually been run on.
 
 ```bash
-git clone <this repo>
+git clone https://github.com/AshrithaG/Threshold.git
 cd Threshold
 npm install
 cp .env.local.example .env.local
 npm run dev
 ```
+
+The code is on `main`. If you land on a branch with only `README.md`, `LICENSE` and
+`.gitignore` in it, you are looking at the pre-merge upstream repo — switch to this fork,
+or to the `threshold-complete` branch, and the other 39 files appear.
 
 Open **http://localhost:3000** and press **Start a scene**.
 
