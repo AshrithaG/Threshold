@@ -15,6 +15,14 @@
 // thing is memory-only, and nothing here is durable across a restart. That
 // matches the product (a scene lasts minutes) and keeps the security story
 // clean: there is no database of emergencies to leak.
+//
+// Two delivery paths sit on top of this. Server-sent events are the nice one.
+// They are also the one that silently fails: a Cloudflare quick tunnel -- the
+// thing standing between judges' phones and this laptop -- buffers the stream
+// and delivers nothing, with a 200 and no error anywhere. So every frame is
+// also kept in a short numbered ring buffer that clients can pull with an
+// ordinary GET. Polling is the path that works through proxies, captive portals
+// and campus wifi, which is to say the path the demo actually runs on.
 // ---------------------------------------------------------------------------
 
 export type BusFrame =
@@ -31,9 +39,24 @@ interface Subscriber {
 /** A scene with no subscribers is dropped after this long. */
 const SCENE_TTL_MS = 45 * 60 * 1000;
 
+/** Frames retained per scene for pollers. A scene emits far fewer than this. */
+const BUFFER_LIMIT = 400;
+
+/** A poller unheard from for this long is dropped from presence. */
+const POLL_PRESENCE_MS = 12000;
+
+interface Buffered {
+  seq: number;
+  frame: BusFrame;
+}
+
 interface Room {
   subs: Set<Subscriber>;
   lastTouched: number;
+  buffer: Buffered[];
+  seq: number;
+  /** id -> last poll time, so pollers count towards presence like subscribers. */
+  pollers: Map<string, number>;
 }
 
 // Next keeps route modules alive across requests, but a dev-mode hot reload can
@@ -56,7 +79,7 @@ function sweep(): void {
   const now = Date.now();
   const all = rooms();
   for (const [code, room] of all) {
-    if (room.subs.size === 0 && now - room.lastTouched > SCENE_TTL_MS) {
+    if (room.subs.size === 0 && room.pollers.size === 0 && now - room.lastTouched > SCENE_TTL_MS) {
       all.delete(code);
     }
   }
@@ -68,7 +91,13 @@ function roomFor(code: string): Room | null {
   const all = rooms();
   let room = all.get(c);
   if (!room) {
-    room = { subs: new Set<Subscriber>(), lastTouched: Date.now() };
+    room = {
+      subs: new Set<Subscriber>(),
+      lastTouched: Date.now(),
+      buffer: [],
+      seq: 0,
+      pollers: new Map<string, number>(),
+    };
     all.set(c, room);
   }
   room.lastTouched = Date.now();
@@ -76,8 +105,13 @@ function roomFor(code: string): Room | null {
 }
 
 function presenceIds(room: Room): string[] {
+  const now = Date.now();
   const seen = new Set<string>();
   for (const s of room.subs) seen.add(s.id);
+  for (const [id, at] of room.pollers) {
+    if (now - at <= POLL_PRESENCE_MS) seen.add(id);
+    else room.pollers.delete(id);
+  }
   return Array.from(seen);
 }
 
@@ -126,6 +160,16 @@ export function subscribe(
 export function publish(code: string, frame: BusFrame): void {
   const room = roomFor(code);
   if (!room) return;
+
+  // Buffer first. A poller that is mid-request when this lands must still see
+  // the frame on its next pull, so retention cannot depend on anyone being
+  // subscribed right now.
+  room.seq += 1;
+  room.buffer.push({ seq: room.seq, frame });
+  if (room.buffer.length > BUFFER_LIMIT) {
+    room.buffer.splice(0, room.buffer.length - BUFFER_LIMIT);
+  }
+
   const from = 'from' in frame ? frame.from : null;
   for (const s of room.subs) {
     if (from && s.id === from) continue;
@@ -135,6 +179,37 @@ export function publish(code: string, frame: BusFrame): void {
       /* the stream will be reaped by its own cancel handler */
     }
   }
+}
+
+/**
+ * Pull everything this client has not seen. `since` is the last seq it
+ * acknowledged; 0 means "whatever is still buffered".
+ *
+ * Frames the caller itself published are skipped, exactly as publish() skips
+ * the author when pushing -- a client has already applied its own action, and
+ * replaying it would double-apply joins.
+ */
+export function poll(
+  code: string,
+  id: string,
+  since: number,
+): { seq: number; frames: BusFrame[]; presence: string[] } {
+  const room = roomFor(code);
+  if (!room) return { seq: 0, frames: [], presence: [] };
+
+  const self = String(id || '').slice(0, 64);
+  room.pollers.set(self, Date.now());
+
+  const from = Number.isFinite(since) && since > 0 ? Math.floor(since) : 0;
+  const frames: BusFrame[] = [];
+  for (const item of room.buffer) {
+    if (item.seq <= from) continue;
+    const author = 'from' in item.frame ? (item.frame as any).from : null;
+    if (author && author === self) continue;
+    frames.push(item.frame);
+  }
+
+  return { seq: room.seq, frames, presence: presenceIds(room) };
 }
 
 /** Diagnostics for the health panel. Never includes scene contents. */

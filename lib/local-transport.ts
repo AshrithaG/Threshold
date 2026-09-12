@@ -12,6 +12,14 @@
 // outbound websocket, which is the honest answer for "will the demo work on
 // conference wifi".
 //
+// Downstream is a poll, not a stream, and that is deliberate. Server-sent
+// events work perfectly on localhost and deliver NOTHING through a Cloudflare
+// quick tunnel, which is what judges' phones will be talking to: the tunnel
+// buffers the response and hands back a 200 with no frames and no error. That
+// failure is invisible until the room does not sync. A short GET on a loop has
+// no such failure mode -- it works through proxies, tunnels and campus wifi --
+// and at this interval the room still feels immediate.
+//
 // Like the Supabase path, this module is not allowed to throw at a caller. A
 // dead stream degrades to single-device and says so through getStatus().
 // ---------------------------------------------------------------------------
@@ -23,8 +31,15 @@ import type { RealtimeHandle, RealtimeStatus } from '@/lib/realtime';
 /** Host snapshots are coalesced; matches STATE_THROTTLE_MS in realtime.ts. */
 const STATE_THROTTLE_MS = 250;
 
-/** EventSource reconnects on its own, but only after the browser's own backoff. */
-const RECONNECT_MS = 1500;
+/**
+ * Downstream poll interval. Roles change every few seconds, so this is well
+ * inside human reaction time, and it keeps a four-phone scene at a handful of
+ * tiny requests per second.
+ */
+const POLL_MS = 900;
+
+/** Consecutive failed polls before the badge stops claiming to be live. */
+const POLL_FAIL_LIMIT = 3;
 
 function safe(fn: () => void): void {
   try {
@@ -67,69 +82,71 @@ export function joinLocalChannel(
   const presenceCbs: Array<(ids: string[]) => void> = [];
 
   let status: RealtimeStatus = 'connecting';
-  let source: EventSource | null = null;
   let dead = false;
-  let retry: ReturnType<typeof setTimeout> | null = null;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let inFlight = false;
+  let since = 0;
+  let fails = 0;
 
   let pendingState: SceneState | null = null;
   let stateTimer: ReturnType<typeof setTimeout> | null = null;
 
-  const open = () => {
+  const applyFrame = (frame: any) => {
+    if (!frame || typeof frame !== 'object') return;
+    if (frame.kind === 'action' && frame.action) {
+      for (const cb of actionCbs) safe(() => cb(frame.action as SceneAction));
+    } else if (frame.kind === 'state' && frame.state) {
+      for (const cb of stateCbs) safe(() => cb(frame.state as SceneState));
+    } else if (frame.kind === 'presence' && Array.isArray(frame.ids)) {
+      for (const cb of presenceCbs) safe(() => cb(frame.ids as string[]));
+    }
+  };
+
+  const schedule = () => {
     if (dead) return;
-    try {
-      const url = `/api/scene/stream?code=${encodeURIComponent(code)}&id=${encodeURIComponent(selfId)}`;
-      source = new EventSource(url);
-    } catch {
-      status = 'offline';
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(tick, POLL_MS);
+  };
+
+  const tick = async () => {
+    if (dead || inFlight) {
+      schedule();
       return;
     }
+    inFlight = true;
+    try {
+      const url =
+        `/api/scene/poll?code=${encodeURIComponent(code)}` +
+        `&id=${encodeURIComponent(selfId)}&since=${since}`;
+      const res = await fetch(url, { cache: 'no-store' });
+      if (!res.ok) throw new Error(`poll ${res.status}`);
+      const data = await res.json();
 
-    source.onopen = () => {
+      // Advance the cursor before dispatching: a subscriber that throws must
+      // not make this client replay the same frames forever.
+      if (typeof data?.seq === 'number' && data.seq >= since) since = data.seq;
+
+      fails = 0;
       status = 'live';
-    };
 
-    source.onmessage = (e: MessageEvent) => {
-      let frame: any;
-      try {
-        frame = JSON.parse(String(e.data));
-      } catch {
-        return;
+      if (Array.isArray(data?.frames)) {
+        for (const frame of data.frames) applyFrame(frame);
       }
-      if (!frame || typeof frame !== 'object') return;
-
-      // Any frame at all proves the pipe is up, including the keepalive.
-      status = 'live';
-
-      if (frame.kind === 'action' && frame.action) {
-        for (const cb of actionCbs) safe(() => cb(frame.action as SceneAction));
-      } else if (frame.kind === 'state' && frame.state) {
-        for (const cb of stateCbs) safe(() => cb(frame.state as SceneState));
-      } else if (frame.kind === 'presence' && Array.isArray(frame.ids)) {
-        for (const cb of presenceCbs) safe(() => cb(frame.ids as string[]));
+      if (Array.isArray(data?.presence)) {
+        for (const cb of presenceCbs) safe(() => cb(data.presence as string[]));
       }
-    };
-
-    source.onerror = () => {
-      // EventSource retries by itself unless the server closed cleanly. Report
-      // the truth in the meantime rather than showing a live badge over a dead
-      // pipe, and re-open by hand if the browser gave up entirely.
-      status = 'connecting';
-      if (source && source.readyState === 2 /* CLOSED */) {
-        status = 'offline';
-        try {
-          source.close();
-        } catch {
-          /* already gone */
-        }
-        source = null;
-        if (retry) clearTimeout(retry);
-        retry = setTimeout(open, RECONNECT_MS);
-      }
-    };
+    } catch {
+      fails += 1;
+      if (fails >= POLL_FAIL_LIMIT) status = 'offline';
+      else if (status === 'live') status = 'connecting';
+    } finally {
+      inFlight = false;
+      schedule();
+    }
   };
 
   if (typeof window !== 'undefined' && selfId) {
-    open();
+    void tick();
   } else {
     status = 'offline';
   }
@@ -170,14 +187,10 @@ export function joinLocalChannel(
     leave() {
       dead = true;
       status = 'offline';
-      if (retry) clearTimeout(retry);
+      if (timer) clearTimeout(timer);
       if (stateTimer) clearTimeout(stateTimer);
-      try {
-        source?.close();
-      } catch {
-        /* already gone */
-      }
-      source = null;
+      timer = null;
+      stateTimer = null;
     },
 
     getStatus() {
