@@ -87,7 +87,7 @@ clearly, and keep talking while they scan. Do not stand in silence watching them
 2. Their phones will not load the page: "Our tunnel is being a hackathon tunnel. I have two
    phones already in the scene." Pick up the two spare phones and continue the entire demo
    with those plus the laptop. Every later beat works with three devices you control.
-3. Supabase is down and the app shows the single-device banner: point at the banner and say
+3. The app shows the single-device banner (no transport reached): point at the banner and say
    "that banner is the app telling you it lost multiplayer and dropped to single device, on
    purpose, instead of showing you a white screen. Let me show you the same allocation on
    one device." Then run the rest on the laptop with simulated responders. **This is a

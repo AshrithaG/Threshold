@@ -46,8 +46,10 @@ screen, and reallocated the moment the roster changes.
       |                  |                  |                    |
       +---------+--------+---------+--------+----------+---------+
                                    |
-                 Supabase Realtime channel  "scene:<CODE>"
-                 broadcast: SceneAction, periodic full SceneState, presence
+            scene transport  -- topic/scene code "<CODE>"
+            carries: SceneAction, periodic full SceneState, presence
+            tier 1  in-process bus + polling  (no keys, no account)
+            tier 2  Supabase Realtime         (used when configured)
                                    |
                                    v
                  HOST DEVICE holds the authoritative SceneState
@@ -104,13 +106,31 @@ Two properties are load-bearing and worth saying out loud:
    the same `RoleId` set the deterministic planner uses. If it fails or is slow, the
    deterministic planner produces a valid plan and the UI marks it `degraded`.
 
+### Why the transport polls instead of streaming
+
+Server-sent events were the first implementation and they work perfectly on a
+local network. They deliver **nothing** through a Cloudflare quick tunnel: the
+tunnel buffers the response, hands back a 200, and reports no error on either
+end. That is exactly the path between a judge's phone and the laptop, and the
+failure is invisible until the room silently fails to sync.
+
+So the downstream is an ordinary GET on a short loop. There is no stream for a
+proxy to hold open, nothing to buffer, and no upgrade to negotiate, which means
+it also survives captive portals and locked-down campus wifi. At ~900ms the room
+still feels immediate, because roles change on the order of seconds.
+
+`/api/scene/stream` is still there and still works locally. It is simply not
+what the demo depends on.
+
 ### Module map
 
 | File | Runs on | Responsibility |
 | --- | --- | --- |
 | `lib/types.ts` | both | The shared contract. Do not change a field name without updating everything. |
 | `lib/scene.ts` | both | Pure reducer, join code generation, clock formatting. No I/O. |
-| `lib/realtime.ts` | client | Supabase channel: broadcast, presence, state sync. |
+| `lib/realtime.ts` | client | Picks a transport: Supabase if configured, else the local bus. |
+| `lib/local-transport.ts` | client | Keyless transport: POST up, poll down. What the demo runs on. |
+| `lib/server-bus.ts` | server | In-process fan-out and frame ring buffer, one room per scene code. |
 | `lib/roles.ts` | both | `deterministicPlan(state)`. The floor under everything. |
 | `lib/commander.ts` | client | Calls `/api/commander`, falls back to `deterministicPlan`. |
 | `app/api/commander/route.ts` | server | The only reader of `IFM_API_KEY` / `LOCAL_MODEL_URL`. |
@@ -143,8 +163,8 @@ inside `app/api/*` route handlers.
 | `LOCAL_MODEL_URL` | server | Offline commander: an OpenAI-compatible endpoint on a GPU box (see `scripts/local-model.sh`). Tried when the hosted call fails, or preferred if you want the demo fully local. | Skipped. Falls through to the hosted model, then to the deterministic plan. |
 | `LOCAL_MODEL_NAME` | server | Model id to send to that local endpoint. | Defaults to `k2-horizon-0.9b`. Only meaningful with `LOCAL_MODEL_URL` set. |
 | `NEXT_PUBLIC_MAPBOX_TOKEN` | **browser** | Walking route and ETA to the nearest AED, with turn-by-turn steps. | `aedRoute()` returns `null` after its 3s timeout. The AED screen shows the static demo AED list with location names only: no route line, no ETA, no steps. The AED role is still assigned and still spoken. |
-| `NEXT_PUBLIC_SUPABASE_URL` | **browser** | Cross-device multiplayer: everyone in the room on their own phone. | `realtimeAvailable()` returns `false`. The app runs in **single-device mode**: one phone holds the scene, roles are assigned to simulated participants locally, and a persistent banner says so. Joining by code does not work. |
-| `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` | **browser** | Same as above. | Same as above: single-device mode with a visible banner. |
+| `NEXT_PUBLIC_SUPABASE_URL` | **browser** | *Optional.* Uses Supabase Realtime for cross-device sync instead of this app's own bus. Worth setting only if you deploy across more than one server process. | Falls back to `lib/local-transport.ts`: multi-device still works, coordinated through the one server every phone already loaded the page from. No banner, no loss of function. |
+| `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` | **browser** | Same as above. | Same as above. |
 
 A quick way to sanity check the degradation story before a demo: rename `.env.local`, reload,
 and walk the whole flow. It should be fully usable with zero keys. If anything hard-fails,
@@ -258,7 +278,8 @@ did something, and we have not tested, benchmarked, or validated it.
 | --- | --- | --- |
 | Pure scene state machine (`lib/scene.ts`) | **Real** | Deterministic reducer, no I/O, identical on every device. |
 | Deterministic role allocation (`lib/roles.ts`) | **Real** | Runs with zero keys and whenever the model is slow or wrong. This is the floor under the whole demo. |
-| Multi-device join, presence, live sync | **Real, needs Supabase** | Supabase Realtime broadcast plus presence. Without the two `NEXT_PUBLIC_SUPABASE_*` vars it degrades to single-device mode with a banner. |
+| Multi-device join, presence, live sync | **Real, no keys required** | An in-process bus with a frame ring buffer; clients POST actions up and poll down every ~900ms. Verified with two devices in one scene over a public tunnel. Supabase Realtime is used instead when configured. |
+| Commander latency | **Measured** | `IFM/K2-Horizon-375B-A23B` answers the allocation contract in roughly 5-13s on the hackathon endpoint. `deterministicPlan()` is applied synchronously first, so the model is never on the critical path to someone starting compressions. |
 | Commander reasoning (K2 Horizon) | **Real when `IFM_*` is set** | 6s timeout, JSON-validated against `RoleId`, any failure falls back to deterministic. |
 | Per-device job assignment and speech | **Real** | Each phone renders and speaks only its own assignment. |
 | Voice tiering | **Real** | Grok realtime, Grok TTS, browser `speechSynthesis`, silent captions. Browsers require one user gesture before audio, which is why "tap once on every device" is in the pre-flight. |
