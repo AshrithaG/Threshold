@@ -11,6 +11,12 @@ paramedic.
 
 **This is a simulation built at a hackathon. It is not a medical device. Call 911.**
 
+> **Just want to run it?** Run `npm install`, copy `.env.local.example` to `.env.local`,
+> then `npm run dev`, and open http://localhost:3000. No API keys needed — it degrades
+> honestly and tells you which tier it is on. Full instructions, including how to get two
+> participants out of one laptop, are in [Run it](#run-it). For phones, read
+> [NETWORK.md](NETWORK.md) first.
+
 ---
 
 ## The problem, stated honestly
@@ -172,16 +178,115 @@ that is a bug in the module that owns it.
 
 ---
 
-## Setup
+## Run it
+
+Built and tested on Node v25.9.0 / npm 11.12.1, macOS on Apple silicon. Next 15 requires
+Node 18.18 or newer; anything in that range should be fine, but v25.9.0 is the only one
+this has actually been run on.
 
 ```bash
+git clone <this repo>
+cd Threshold
 npm install
-cp .env.local.example .env.local     # then fill in whatever you have; blanks are fine
-npm run dev                          # binds 0.0.0.0:3000
+cp .env.local.example .env.local
+npm run dev
 ```
 
-Open `http://localhost:3000` on the laptop. That is enough to see the host screen, but it is
-**not** enough for phones. See the next section.
+Open **http://localhost:3000** and press **Start a scene**.
+
+That is the whole setup. **You do not need any API keys to run this.** Every integration
+has a working fallback and the app tells you which tier it is on — see
+[What you get with no keys](#what-you-get-with-no-keys) below.
+
+### Seeing the multiplayer part on one laptop
+
+This is the bit that matters and the bit that is easy to get wrong.
+
+Each device identifies itself with a UUID in `localStorage`, and `localStorage` is
+per-origin. **Two tabs on the same origin are the same device** — the second tab inherits
+the first tab's id *and* its host flag, so it opens as the host again instead of joining,
+and the roster stays at one person. That is not a bug in the app, it is two tabs sharing a
+browser profile.
+
+To get two real participants out of one laptop, make the second tab a different origin or
+a different profile. Any of these work:
+
+| Tab 1 (host) | Tab 2 (responder) |
+| --- | --- |
+| `http://localhost:3000/scene/XXXX?host=1` | `http://127.0.0.1:3000/scene/XXXX` |
+| normal window | private / incognito window |
+| Chrome | Safari or Firefox |
+
+So:
+
+1. Start a scene in tab 1. Note the 4-character code in the big type.
+2. Open tab 2 at one of the origins above, on `/scene/<CODE>` **without** `?host=1`.
+3. Within a second or two the host roster goes to **ON SCENE 2** and both phones show a
+   *different* job. The responder's card says `CALL 911`; the host stays on compressions.
+
+Real phones do not have this problem — separate devices have separate storage — so just
+scan the QR. For that you need HTTPS; see the next section and `NETWORK.md`.
+
+### What you get with no keys
+
+Nothing is stubbed out or faked when a key is missing. The tier in use is printed on the
+landing page under **Integrations** and in the scene header under **PLAN BY**.
+
+| Feature | With no keys at all | With keys |
+| --- | --- | --- |
+| Multi-device join, roles, live reassignment | **Works.** In-process bus, no account needed | Same, or Supabase Realtime if configured |
+| Role allocation and reasoning | `deterministicPlan()`, marked `degraded` in the UI | K2 Horizon reasoning, marked `live`, ~5-13s |
+| Spoken assignments | Browser `speechSynthesis` | Grok TTS, one voice stream per phone |
+| AED route | Straight-line distance and ETA | Mapbox walking route with turn-by-turn |
+| Compression rate coach | **Works.** Camera + metronome are fully local | Same |
+| EMS handoff record | **Works.** Pure state machine | Same |
+
+To turn a tier on, fill the matching variable in `.env.local` and **restart `npm run dev`**
+— Next reads `.env.local` at boot, so a key pasted into a running server does nothing.
+Every variable and its exact failure behaviour is in
+[Environment variables](#environment-variables).
+
+### Check what is actually wired up
+
+```bash
+curl -s localhost:3000/api/health | python3 -m json.tool
+```
+
+```json
+{
+  "k2":        { "ok": true, "model": "IFM/K2-Horizon-375B-A23B" },
+  "voice":     { "ok": true, "mode": "grok-tts" },
+  "realtime":  { "ok": true, "mode": "local-bus" },
+  "mapbox":    { "ok": true },
+  "localModel":{ "ok": false }
+}
+```
+
+`ok` means only "the variables this integration needs are non-empty" — it makes no outbound
+calls. To prove the commander really reaches K2, watch `PLAN BY` in the scene header: it
+reads `deterministic` for the instant first plan, then flips to the model id a few seconds
+later. Or hit it directly:
+
+```bash
+curl -s -X POST localhost:3000/api/commander -H 'content-type: application/json' -d '{"state":{"code":"TEST","createdAt":0,"participants":[{"id":"a","name":"A","role":"compressions","status":"active","trained":false},{"id":"b","name":"B","role":"unassigned","status":"active","trained":true}],"events":[],"aedStatus":"unknown","online":true}}' | python3 -m json.tool
+```
+
+`"degraded": false` with a `"model"` of `IFM/...` means the model answered. `"degraded":
+true` means it did not, and the deterministic commander covered — which is the designed
+behaviour, not a failure.
+
+### Things that will waste your afternoon
+
+- **Do not run `npm run build` while `npm run dev` is running.** The build rewrites `.next`
+  underneath the dev server and every route starts returning 500 with
+  `Cannot find module './vendor-chunks/...'`. Fix: stop both, `rm -rf .next`, `npm run dev`.
+- **A key pasted into a running dev server has no effect.** Restart it.
+- **Scene sync is a poll, not a stream, on purpose.** Server-sent events return zero frames
+  through a Cloudflare tunnel with no error anywhere. `/api/scene/stream` still exists and
+  still works on a LAN; the client does not use it. Please do not switch it back before the
+  demo — see `NETWORK.md`.
+- **Phones on a plain LAN IP get no camera.** `getUserMedia` needs a secure context. Next
+  section.
 
 ---
 
