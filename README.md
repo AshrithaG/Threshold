@@ -294,6 +294,46 @@ behaviour, not a failure.
 
 ---
 
+## Deploying
+
+There is a `render.yaml` in the repo. Render, not Vercel, and the reason is
+architectural rather than preference:
+
+> Scene state lives **in memory**, one room per join code
+> (`lib/server-bus.ts`). Every phone in a scene must reach the **same process**.
+> On serverless each request can land on a different instance, so two phones
+> would poll different memories and simply never see each other -- with no
+> error, on either side. A single always-on instance is the requirement.
+
+If you do want Vercel, wire `NEXT_PUBLIC_SUPABASE_URL` and
+`NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` first. `lib/realtime.ts` already prefers
+Supabase Realtime when it is configured, so that path needs no code change --
+only then is the transport safe to fan out across instances.
+
+### Render, from the browser
+
+1. [dashboard.render.com](https://dashboard.render.com) -> **New** -> **Blueprint**
+2. Connect the GitHub repo. Render reads `render.yaml` and fills in the build and
+   start commands, the health check, and the non-secret env vars.
+3. It will prompt for the three secrets, which are the only things not in the file:
+   `IFM_API_KEY`, `XAI_API_KEY`, `NEXT_PUBLIC_MAPBOX_TOKEN`.
+4. Apply, and wait for the first build.
+
+Then open `https://<your-service>.onrender.com/api/health` and confirm every
+integration reads `true`.
+
+### Two things about deploying this specifically
+
+- **`NEXT_PUBLIC_MAPBOX_TOKEN` is read at BUILD time, not run time.** Next inlines
+  `NEXT_PUBLIC_*` into the browser bundle, so if you add it after the first build
+  you must trigger a rebuild or the client ships without it. It is also
+  world-readable by design -- use a public `pk.*` token with URL restrictions,
+  never a secret `sk.*` one.
+- **Free instances sleep after about 15 minutes idle** and take roughly 30
+  seconds to wake. Load the page once before anyone demos on it.
+
+---
+
 ## HTTPS is not optional for the phones
 
 Camera and microphone are gated behind a **secure context**. `http://localhost` counts as

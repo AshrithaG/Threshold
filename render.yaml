@@ -1,0 +1,57 @@
+# Render blueprint for Threshold.
+#
+# Why a persistent web service and not a serverless function: scene state lives
+# in memory, one room per join code (lib/server-bus.ts). Phones in the same
+# scene must reach the same process, or they poll different memories and nobody
+# can join. A single always-on instance is the whole requirement.
+#
+# Secrets are declared with `sync: false`, which means Render prompts for them
+# in the dashboard and never reads them from this file. Nothing here is secret,
+# which is why it is safe to commit.
+
+services:
+  - type: web
+    name: threshold
+    runtime: node
+    plan: free
+    region: ohio
+    branch: main
+
+    buildCommand: npm ci && npm run build
+    startCommand: npm start
+
+    # The app answers this instantly and makes no outbound calls, so it is a
+    # true liveness check rather than a probe of the vendors.
+    healthCheckPath: /api/health
+
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+
+      # --- IFM K2 Horizon: the commander. Without it the deterministic
+      #     planner runs and the UI marks every plan `degraded`.
+      - key: IFM_API_KEY
+        sync: false
+      - key: IFM_BASE_URL
+        value: https://api.ifm.ai/v1
+      - key: IFM_MODEL
+        value: IFM/K2-Horizon-375B-A23B
+
+      # --- xAI Grok: spoken assignments. Without it phones fall back to the
+      #     browser's own speech synthesis.
+      - key: XAI_API_KEY
+        sync: false
+      - key: XAI_BASE_URL
+        value: https://api.x.ai/v1
+      - key: XAI_TTS_VOICE
+        value: eve
+      - key: XAI_VOICE_MODEL
+        value: grok-voice-latest
+
+      # --- Mapbox: AED walking route and ETA.
+      #     NEXT_PUBLIC_ is inlined into the browser bundle at BUILD time, so
+      #     this must be set before the first build or the client ships without
+      #     it. It is also world-readable by design -- use a public pk.* token
+      #     with URL restrictions, never a secret sk.* one.
+      - key: NEXT_PUBLIC_MAPBOX_TOKEN
+        sync: false
